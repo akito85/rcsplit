@@ -18,7 +18,31 @@ use regex_automata::{
 };
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    help = "A CLI tool for splitting files from 1MB to 40GB with optimizations and performance-oriented features.\n\n\
+            Usage:\n\
+            \tcli-rcsplit -i <input_file> -p <pattern> [options]\n\n\
+            Options:\n\
+            \t-i, --input <file>      Input file to split\n\
+            \t-p, --pattern <regex>   Regex pattern to split the file\n\
+            \t-o, --output <dir>      Output directory for chunks (default: out_chunks)\n\
+            \t-t, --trim <usize>      Number of characters to trim from each line (default: 4)\n\
+            \t-b, --buffer_size <usize> Buffer size in KB for writing (default: 256)\n\
+            \t-m, --max_memory <usize>  Maximum memory in MB for processing (default: 512)\n\
+            \t-s, --streaming         Enable streaming mode for large files\n\
+            \t--segment_size <usize>  Segment size in MB for streaming (default: 256)\n\n\
+            Examples:\n\
+            \tcli-rcsplit -i large_file.txt -p '^>' -o splits -t 2 -b 512 -m 1024 -s --segment_size 512\n\n\
+            Notes:\n\
+            \t- The tool uses memory-mapped files for smaller inputs and streaming for larger files.\n\
+            \t- The regex pattern is used to identify chunk boundaries.\n\
+            \t- Use streaming mode for files larger than 10GB or when specified.\n\
+            \t- Adjust buffer and segment sizes for performance tuning."
+)]
 struct Args {
     #[arg(short, long)]
     input: String,
