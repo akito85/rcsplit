@@ -21,27 +21,8 @@ use regex_automata::{
 #[command(
     author,
     version,
-    about,
-    long_about = None,
-    help = "A CLI tool for splitting files from 1MB to 40GB with optimizations and performance-oriented features.\n\n\
-            Usage:\n\
-            \tcli-rcsplit -i <input_file> -p <pattern> [options]\n\n\
-            Options:\n\
-            \t-i, --input <file>      Input file to split\n\
-            \t-p, --pattern <regex>   Regex pattern to split the file\n\
-            \t-o, --output <dir>      Output directory for chunks (default: out_chunks)\n\
-            \t-t, --trim <usize>      Number of characters to trim from each line (default: 4)\n\
-            \t-b, --buffer_size <usize> Buffer size in KB for writing (default: 256)\n\
-            \t-m, --max_memory <usize>  Maximum memory in MB for processing (default: 512)\n\
-            \t-s, --streaming         Enable streaming mode for large files\n\
-            \t--segment_size <usize>  Segment size in MB for streaming (default: 256)\n\n\
-            Examples:\n\
-            \tcli-rcsplit -i large_file.txt -p '^>' -o splits -t 2 -b 512 -m 1024 -s --segment_size 512\n\n\
-            Notes:\n\
-            \t- The tool uses memory-mapped files for smaller inputs and streaming for larger files.\n\
-            \t- The regex pattern is used to identify chunk boundaries.\n\
-            \t- Use streaming mode for files larger than 10GB or when specified.\n\
-            \t- Adjust buffer and segment sizes for performance tuning."
+    about = "A CLI tool for splitting files based on a regex pattern.",
+    long_about = "This tool splits large files into chunks based on a provided regex pattern. It supports both memory-mapped and streaming modes for efficient processing.\n\nUse the --streaming flag for large files or to enable streaming mode manually.\n\nPerformance can be tuned using buffer_size, max_memory, and segment_size options."
 )]
 struct Args {
     #[arg(short, long)]
@@ -187,7 +168,6 @@ fn process_streaming<A: Automaton + Send + Sync>(
 
     rayon::scope(|s| {
         let mut buffer = Vec::with_capacity(segment_size);
-        let mut leftovers = Vec::new();
 
         loop {
             let read_size = segment_size - buffer.len();
@@ -245,12 +225,12 @@ fn process_streaming<A: Automaton + Send + Sync>(
                     });
             });
 
-            leftovers = if let Some(last) = positions.last() {
-                buffer[*last..].to_vec()
+            // Directly update buffer to handle leftovers
+            if let Some(last) = positions.last() {
+                buffer = buffer[*last..].to_vec();
             } else {
-                buffer.clone()
-            };
-            buffer = leftovers.clone();
+                buffer.clear();
+            }
         }
 
         // Process final leftover data
