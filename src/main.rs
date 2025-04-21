@@ -4,19 +4,20 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossbeam_channel::bounded;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex_automata::{
     dfa::{dense, Automaton},
     Anchored, Input,
 };
-use crossbeam_channel::{bounded, Sender, Receiver};
 
 // Command-line argument structure with clap for parsing user inputs
 #[derive(Parser, Debug)]
@@ -28,122 +29,141 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 )]
 struct Args {
     #[arg(short, long)]
-    input: String, // Input file path provided by the user
+    input: String, // Input file path
     #[arg(short, long)]
-    pattern: String, // Regex pattern to identify split points
+    pattern: String, // Regex pattern for split points
     #[arg(short, long, default_value = "out_chunks")]
-    output: String, // Directory where split files will be saved
+    output: String, // Output directory for chunks
     #[arg(short, long, default_value_t = 4)]
-    trim: usize, // Characters to trim from the left of each line after the first
+    trim: usize, // Characters to trim from subsequent lines
     #[arg(short, long, default_value_t = 256)]
-    buffer_size: usize, // Buffer size in KB for writing, affects I/O performance
+    buffer_size: usize, // Buffer size in KB for I/O
     #[arg(short, long, default_value_t = 512)]
-    max_memory: usize, // Max memory in MB (limits memory usage in streaming mode)
+    max_memory: usize, // Max memory in MB for streaming
     #[arg(short, long)]
-    streaming: bool, // Forces streaming mode if true, else auto-decided by file size
+    streaming: bool, // Force streaming mode
     #[arg(short, long, default_value_t = 256)]
-    segment_size: usize, // Segment size in MB for streaming mode, controls memory usage
+    segment_size: usize, // Segment size in MB for streaming
     #[arg(short, long, default_value_t = false)]
     verbose: bool, // Enable verbose logging
     #[arg(long, default_value_t = 0)]
     threads: usize, // Number of threads (0 = auto)
+    #[arg(long, default_value_t = 300)]
+    timeout_secs: u64, // Timeout for worker threads in seconds
 }
 
-// Defines a chunk of data with start/end positions and a unique number
+// Defines a chunk of data with start/end positions and unique number
 #[derive(Debug, Clone)]
 struct Chunk {
-    start: usize, // Starting byte position in the data
-    end: usize, // Ending byte position in the data
-    chunk_num: usize, // Unique identifier for this chunk
+    start: usize, // Start byte position
+    end: usize, // End byte position
+    chunk_num: usize, // Unique chunk identifier
 }
 
-// Processes a single chunk: generates a filename from the first line, trims lines, and writes to file
-fn process_chunk(
-    data: &[u8], // Full data buffer (mapped or streamed) containing all bytes
-    chunk: Chunk, // Chunk metadata specifying the range and number
-    output_dir: &PathBuf, // Directory path for output files
-    trim: usize, // Number of characters to trim from each line except the first
-    buffer_size: usize, // Size of write buffer in KB, tune for I/O efficiency
-    verbose: bool, // Enable verbose logging
-) -> Result<()> {
-    // Quick bounds check to avoid panics
-    if chunk.start >= data.len() || chunk.end > data.len() || chunk.start >= chunk.end {
-        if verbose {
-            eprintln!("Skipping invalid chunk: {:?}, data len: {}", chunk, data.len());
+// Structure for shared buffer in streaming mode
+struct SharedBuffer {
+    data: Arc<Vec<u8>>, // Shared data buffer
+    positions: Vec<usize>, // Split positions
+    segment_offset: usize, // Offset in file
+}
+
+// Generate a sanitized filename from chunk content
+fn generate_filename(data: &[u8], chunk_num: usize) -> String {
+    let mut lines = Vec::with_capacity(2);
+    let mut start = 0;
+    let mut line_count = 0;
+
+    while start < data.len() && line_count < 2 {
+        let line_end = data[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + start)
+            .unwrap_or(data.len());
+
+        lines.push(&data[start..line_end]);
+        line_count += 1;
+        start = line_end + 1;
+
+        if start >= data.len() {
+            break;
         }
-        return Ok(());
     }
 
-    let chunk_data = &data[chunk.start..chunk.end]; // Slice of data for this chunk
+    let name_line = if !lines.is_empty() && lines[0].first() == Some(&b'*') {
+        lines[0]
+    } else if lines.len() > 1 && lines[1].first() == Some(&b'*') {
+        lines[1]
+    } else if !lines.is_empty() {
+        lines[0]
+    } else {
+        "empty".as_bytes()
+    };
 
-    // Find the first newline to get the first line
-    let first_line_end = chunk_data.iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(chunk_data.len());
-
-    let first_line = &chunk_data[..first_line_end];
-
-    // Convert first line to UTF-8 string, fallback to "invalid_utf8" if invalid
-    let first_line_str = std::str::from_utf8(first_line).unwrap_or("invalid_utf8");
-
-    // Sanitize filename by replacing non-alphanumeric chars with '_'
-    let sanitized = first_line_str
+    let line_str = std::str::from_utf8(name_line).unwrap_or("invalid_utf8");
+    let sanitized = line_str
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
 
-    // Limit filename to 100 chars and append chunk number to avoid conflicts
-    let filename = if sanitized.len() > 100 {
-        format!("{}_{:05}.txt", &sanitized[..100], chunk.chunk_num)
+    let prefix = if sanitized.len() > 100 {
+        &sanitized[..100]
     } else {
-        format!("{}_{:05}.txt", sanitized, chunk.chunk_num)
+        &sanitized
     };
 
-    let out_path = output_dir.join(filename); // Full path for the output file
+    format!("{}_{:05}.txt", prefix, chunk_num)
+}
 
-    // Create and write to output file
-    let file = File::create(&out_path)?; // Create the output file, fails if unwritable
-    let mut writer = BufWriter::with_capacity(buffer_size * 1024, file); // Buffered writer for efficiency
+// Process a chunk: generate filename, write all lines, trim subsequent lines
+fn process_chunk(
+    data: &[u8],
+    chunk: Chunk,
+    output_dir: &PathBuf,
+    trim: usize,
+    buffer_size: usize,
+    verbose: bool,
+) -> Result<()> {
+    if chunk.start >= data.len() || chunk.end > data.len() || chunk.start >= chunk.end {
+        if verbose {
+            eprintln!("Skipping invalid chunk: {:?}", chunk);
+        }
+        return Ok(());
+    }
 
-    // If there's content after the first line
-    if first_line_end < chunk_data.len() {
-        // Start after the first line's newline
-        let mut pos = first_line_end + 1;
+    let chunk_data = &data[chunk.start..chunk.end];
+    let filename = generate_filename(chunk_data, chunk.chunk_num);
+    let out_path = output_dir.join(&filename);
 
-        while pos < chunk_data.len() {
-            // Find next newline
-            let line_end = chunk_data[pos..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| p + pos)
-                .unwrap_or(chunk_data.len());
+    let file = File::create(&out_path)
+        .with_context(|| format!("Failed to create file: {}", out_path.display()))?;
+    let mut writer = BufWriter::with_capacity(buffer_size * 1024, file);
 
-            let line = &chunk_data[pos..line_end];
+    // Split chunk into lines (excluding newlines)
+    let lines: Vec<&[u8]> = chunk_data.split(|&b| b == b'\n').collect();
 
-            // Apply trimming if line is long enough
-            if line.len() > trim {
-                writer.write_all(&line[trim..])?;
-            } else if !line.is_empty() {
-                writer.write_all(line)?;
-            }
+    // Process each line
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() && i == lines.len() - 1 {
+            // Skip trailing empty line
+            continue;
+        }
 
-            // Add newline if not the last line
-            if line_end < chunk_data.len() {
-                writer.write_all(b"\n")?;
-            }
+        // Write first line fully, trim subsequent lines
+        if i == 0 {
+            writer.write_all(line)?;
+        } else if line.len() > trim {
+            writer.write_all(&line[trim..])?;
+        } else if !line.is_empty() {
+            writer.write_all(line)?;
+        }
 
-            // Move to position after this newline
-            pos = line_end + 1;
-
-            // Break if we're at the end
-            if pos >= chunk_data.len() {
-                break;
-            }
+        // Add newline unless it's the last line
+        if i < lines.len() - 1 {
+            writer.write_all(b"\n")?;
         }
     }
 
-    writer.flush()?; // Ensure all data is written to disk
-
+    writer.flush()?;
     if verbose {
         println!("Wrote chunk {} to {}", chunk.chunk_num, out_path.display());
     }
@@ -151,93 +171,108 @@ fn process_chunk(
     Ok(())
 }
 
-// Entry point: parses args, sets up dirs, and selects processing mode
+// Entry point: parse args, set up, and select processing mode
 fn main() -> Result<()> {
-    let args = Args::parse(); // Parse CLI args, panics on invalid input
+    let args = Args::parse();
 
-    // Set up thread pool with explicit thread count if specified
-    if args.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()
-            .context("Failed to initialize thread pool")?;
+    if args.threads > 1024 {
+        eprintln!("Warning: High thread count ({}). May impact performance.", args.threads);
+    }
+    if args.buffer_size > 10240 {
+        eprintln!("Warning: Large buffer size ({}KB). May increase memory usage.", args.buffer_size);
     }
 
-    let input_path = PathBuf::from(&args.input); // Path to input file from args
-    let output_dir = PathBuf::from(&args.output); // Output directory path from args
-    fs::create_dir_all(&output_dir)?; // Create output dir, fails if permissions issue
+    // Set up thread pool
+    let thread_count = if args.threads > 0 {
+        args.threads.min(num_cpus::get().max(1))
+    } else {
+        num_cpus::get().max(1)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build_global()
+        .context("Failed to initialize thread pool")?;
 
-    let file = File::open(&input_path)?; // Open input file, fails if not found
-    let file_size = file.metadata()?.len() as usize; // File size in bytes, fails on metadata error
+    let input_path = PathBuf::from(&args.input);
+    if !input_path.exists() {
+        return Err(anyhow::anyhow!("Input file does not exist: {}", input_path.display()));
+    }
 
-    // Pre-compile regex DFA once, share across threads
-    let dfa = Arc::new(
+    let output_dir = PathBuf::from(&args.output);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let file = File::open(&input_path)
+        .with_context(|| format!("Failed to open file: {}", input_path.display()))?;
+    let file_size = file.metadata()?.len() as usize;
+
+    let split_dfa = Arc::new(
         dense::Builder::new()
             .configure(
                 dense::Config::new()
-                    .byte_classes(true) // Enable byte classes for faster matching
-                    .start_kind(regex_automata::dfa::StartKind::Anchored) // Anchored for line-start matches
-                    .prefilter(true) // Enable prefiltering for faster matching
+                    .byte_classes(true)
+                    .start_kind(regex_automata::dfa::StartKind::Anchored),
             )
             .build(&args.pattern)
-            .context("Failed to build DFA")?
+            .context("Failed to build regex pattern")?,
     );
 
     if args.verbose {
         println!("Processing file: {} ({} bytes)", args.input, file_size);
     }
 
-    // Choose processing mode: streaming for large files (>available memory) or forced
+    if file_size == 0 {
+        println!("Empty input file. Nothing to process.");
+        return Ok(());
+    }
+
     let max_memory_bytes = args.max_memory * 1024 * 1024;
     if args.streaming || file_size > max_memory_bytes {
         if args.verbose {
             println!("Using streaming mode");
         }
-        process_streaming(file, file_size, &output_dir, &args, &dfa) // Stream for big files
+        process_streaming(file, file_size, &output_dir, &args, &split_dfa)
     } else {
         if args.verbose {
             println!("Using memory-mapped mode");
         }
-        process_mapped(file, file_size, &output_dir, &args, &dfa) // Memory-map for smaller files
+        process_mapped(file, file_size, &output_dir, &args, &split_dfa)
     }
 }
 
-// Processes file using memory mapping, ideal for smaller files
+// Process file using memory mapping
 fn process_mapped<A: Automaton + Send + Sync>(
-    file: File, // Opened input file
-    file_size: usize, // Total size of the file in bytes
-    output_dir: &PathBuf, // Directory to save chunks
-    args: &Args, // User-provided arguments
-    dfa: &Arc<A>, // Thread-safe DFA for pattern matching
+    file: File,
+    file_size: usize,
+    output_dir: &PathBuf,
+    args: &Args,
+    split_dfa: &Arc<A>,
 ) -> Result<()> {
-    let mmap = unsafe { Mmap::map(&file)? }; // Memory-map file, fails on mapping error
-    let counter = AtomicUsize::new(0); // Thread-safe counter for chunk numbering
+    let mmap = unsafe { Mmap::map(&file)? };
+    let counter = AtomicUsize::new(0);
 
-    // Pre-calculate split points in parallel
-    // This step leverages multi-core processing
-    let positions = find_split_positions(&mmap, file_size, dfa, args.verbose)?;
-
-    // Process chunks in parallel
+    let positions = find_split_positions(&mmap, file_size, split_dfa, args.verbose)?;
     process_chunks(&mmap, positions, output_dir, &counter, args)
 }
 
-// Find all positions where the pattern matches at the start of a line
+// Find split positions in the data
 fn find_split_positions<A: Automaton + Send + Sync>(
     data: &[u8],
     file_size: usize,
     dfa: &Arc<A>,
     verbose: bool,
 ) -> Result<Vec<usize>> {
-    // Calculate optimal chunk size for parallelism
-    // Use smaller chunks for better load balancing
-    let chunk_size = (file_size / rayon::current_num_threads()).max(1024 * 1024);
+    if file_size == 0 {
+        return Ok(vec![0]);
+    }
+
+    let chunk_size = (file_size / rayon::current_num_threads().max(1)).max(1024 * 1024);
     let chunk_count = (file_size + chunk_size - 1) / chunk_size;
 
     if verbose {
-        println!("Searching for pattern matches in {} chunks", chunk_count);
+        println!("Searching for matches in {} chunks", chunk_count);
     }
 
-    // Process file in chunks to improve cache locality
     let positions: Vec<usize> = (0..chunk_count)
         .into_par_iter()
         .flat_map(|i| {
@@ -245,21 +280,16 @@ fn find_split_positions<A: Automaton + Send + Sync>(
             let end = (start + chunk_size).min(file_size);
             let mut matches = Vec::with_capacity(1024);
 
-            // Always include the first position in the first chunk
             if i == 0 {
                 matches.push(0);
             }
 
-            // Find all matches in this chunk
             for pos in start..end {
-                // Check if this is a line start (first byte or follows newline)
-                if (pos == 0 || data[pos-1] == b'\n') && pos < file_size {
+                if (pos == 0 || data.get(pos - 1) == Some(&b'\n')) && pos < file_size {
                     let input = Input::new(&data[pos..])
                         .anchored(Anchored::Yes)
                         .range(..file_size - pos);
-
-                    // Check for pattern match
-                    if dfa.try_search_fwd(&input).map_or(false, |o| o.is_some()) {
+                    if matches!(dfa.try_search_fwd(&input), Ok(Some(_))) {
                         matches.push(pos);
                     }
                 }
@@ -269,12 +299,9 @@ fn find_split_positions<A: Automaton + Send + Sync>(
         })
         .collect();
 
-    // Create an ordered, deduplicated list of positions
     let mut result = positions;
     result.sort_unstable();
     result.dedup();
-
-    // Always include the file end
     if !result.contains(&file_size) {
         result.push(file_size);
     }
@@ -286,7 +313,7 @@ fn find_split_positions<A: Automaton + Send + Sync>(
     Ok(result)
 }
 
-// Process chunks in parallel based on split positions
+// Process chunks in parallel
 fn process_chunks(
     data: &[u8],
     positions: Vec<usize>,
@@ -294,29 +321,25 @@ fn process_chunks(
     counter: &AtomicUsize,
     args: &Args,
 ) -> Result<()> {
-    // Create chunks from adjacent positions
-    let chunks: Vec<_> = positions.windows(2)
-        .map(|window| {
-            Chunk {
-                start: window[0],
-                end: window[1],
-                chunk_num: counter.fetch_add(1, Ordering::Relaxed),
-            }
+    let chunks: Vec<_> = positions
+        .windows(2)
+        .map(|window| Chunk {
+            start: window[0],
+            end: window[1],
+            chunk_num: counter.fetch_add(1, Ordering::Relaxed),
         })
         .collect();
 
-    // Process chunks in parallel
-    chunks.into_par_iter()
-        .try_for_each(|chunk| {
-            process_chunk(
-                data,
-                chunk,
-                output_dir,
-                args.trim,
-                args.buffer_size,
-                args.verbose
-            )
-        })?;
+    chunks.into_par_iter().try_for_each(|chunk| {
+        process_chunk(
+            data,
+            chunk,
+            output_dir,
+            args.trim,
+            args.buffer_size,
+            args.verbose,
+        )
+    })?;
 
     if args.verbose {
         println!("Processed {} chunks", counter.load(Ordering::Relaxed));
@@ -325,34 +348,25 @@ fn process_chunks(
     Ok(())
 }
 
-// Processes file in streaming mode, suitable for large files
-fn process_streaming<A: Automaton + Send + Sync>(
-    file: File, // Opened input file
-    file_size: usize, // File size in bytes
-    output_dir: &PathBuf, // Directory to save chunks
-    args: &Args, // User-provided arguments
-    dfa: &Arc<A>, // Thread-safe DFA for pattern matching
+// Process file in streaming mode
+fn process_streaming<A: Automaton + Send + Sync + 'static>(
+    file: File,
+    file_size: usize,
+    output_dir: &PathBuf,
+    args: &Args,
+    split_dfa: &Arc<A>,
 ) -> Result<()> {
-    // Calculate optimal segment size based on available memory
     let segment_size = args.segment_size * 1024 * 1024;
-
-    // Track bytes processed for progress reporting
     let processed_bytes = Arc::new(AtomicUsize::new(0));
-
-    // Create bounded channel for work distribution
-    // Use channel size based on available memory and thread count
     let channel_size = (args.max_memory * 1024 * 1024 / segment_size)
-        .max(2)  // At least 2 slots
-        .min(16); // No more than 16 slots to limit memory usage
-
-    let (chunk_sender, chunk_receiver) = bounded::<(Vec<u8>, Vec<usize>)>(channel_size);
-
-    // Create progress counter
+        .max(2)
+        .min(16);
+    let (chunk_sender, chunk_receiver) = bounded::<SharedBuffer>(channel_size);
+    let (done_sender, done_receiver) = bounded::<()>(1);
     let counter = Arc::new(AtomicUsize::new(0));
 
-    // Start worker threads pool
-    let worker_count = rayon::current_num_threads().min(8); // Limit worker count
-    let workers: Vec<_> = (0..worker_count)
+    let worker_count = rayon::current_num_threads().min(8).max(1);
+    let _workers: Vec<_> = (0..worker_count)
         .map(|worker_id| {
             let rx = chunk_receiver.clone();
             let output_dir = output_dir.clone();
@@ -362,171 +376,154 @@ fn process_streaming<A: Automaton + Send + Sync>(
             let verbose = args.verbose;
             let trim = args.trim;
             let buffer_size = args.buffer_size;
+            let done_tx = done_sender.clone();
+            let timeout = Duration::from_secs(args.timeout_secs);
 
             std::thread::spawn(move || -> Result<()> {
-                // Process chunks as they arrive
-                while let Ok((buffer, positions)) = rx.recv() {
-                    if positions.len() < 2 {
-                        continue; // Need at least start and end positions
-                    }
+                loop {
+                    match rx.recv_timeout(timeout) {
+                        Ok(shared_buffer) => {
+                            let positions = &shared_buffer.positions;
+                            let segment_offset = shared_buffer.segment_offset;
 
-                    // Track progress
-                    if verbose && worker_id == 0 {
-                        let bytes = processed_bytes.load(Ordering::Relaxed);
-                        let progress = (bytes as f64 / file_size as f64) * 100.0;
-                        println!("Progress: {:.2}% ({}/{} bytes)",
-                                progress, bytes, file_size);
-                    }
+                            if positions.len() < 2 {
+                                continue;
+                            }
 
-                    // Process each chunk in this segment
-                    for window in positions.windows(2) {
-                        let chunk = Chunk {
-                            start: window[0],
-                            end: window[1],
-                            chunk_num: counter.fetch_add(1, Ordering::Relaxed),
-                        };
+                            if verbose && worker_id == 0 {
+                                let bytes = processed_bytes.load(Ordering::Relaxed);
+                                let progress = (bytes as f64 / file_size as f64) * 100.0;
+                                println!(
+                                    "Progress: {:.2}% ({}/{} bytes)",
+                                    progress, bytes, file_size
+                                );
+                            }
 
-                        if let Err(e) = process_chunk(
-                            &buffer,
-                            chunk,
-                            &output_dir,
-                            trim,
-                            buffer_size,
-                            verbose,
-                        ) {
-                            eprintln!("Chunk error: {}", e);
+                            for window in positions.windows(2) {
+                                let chunk = Chunk {
+                                    start: window[0] - segment_offset,
+                                    end: window[1] - segment_offset,
+                                    chunk_num: counter.fetch_add(1, Ordering::Relaxed),
+                                };
+
+                                if chunk.start >= shared_buffer.data.len()
+                                    || chunk.end > shared_buffer.data.len()
+                                    || chunk.start >= chunk.end
+                                {
+                                    if verbose {
+                                        eprintln!(
+                                            "Invalid chunk bounds: start={}, end={}, buffer_len={}",
+                                            chunk.start, chunk.end, shared_buffer.data.len()
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                if let Err(e) = process_chunk(
+                                    shared_buffer.data.as_slice(),
+                                    chunk,
+                                    &output_dir,
+                                    trim,
+                                    buffer_size,
+                                    verbose,
+                                ) {
+                                    eprintln!("Chunk error: {}", e);
+                                }
+                            }
                         }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            if rx.is_empty() {
+                                break;
+                            }
+                            if verbose && worker_id == 0 {
+                                println!("Worker {} timeout, continuing...", worker_id);
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
 
+                let _ = done_tx.send(());
                 Ok(())
             })
         })
         .collect();
 
-    // Producer thread: read file and find split points
-    let reader_thread = {
-        let dfa = dfa.clone();
+    let reader_handle = {
+        let split_dfa = split_dfa.clone();
         let sender = chunk_sender.clone();
         let processed_bytes = processed_bytes.clone();
         let verbose = args.verbose;
 
         std::thread::spawn(move || -> Result<()> {
-            // Use a large buffer for efficient reading
             let mut reader = BufReader::with_capacity(segment_size, file);
+            let mut absolute_pos = 0;
+            let mut at_line_start = true;
 
-            // Main state variables
-            let mut buffer = Vec::with_capacity(segment_size * 2);
-            let mut last_match_pos = 0;
-            let mut eof_reached = false;
-
-            while !eof_reached {
-                // Handle buffer management
-                if last_match_pos > 0 && buffer.len() >= segment_size {
-                    // Shift buffer to remove processed data
-                    buffer.drain(0..last_match_pos);
-                    last_match_pos = 0;
-                }
-
-                // Read next segment
-                let bytes_to_read = segment_size - (buffer.len() - last_match_pos);
-                let mut chunk = vec![0; bytes_to_read];
-
-                match reader.read(&mut chunk) {
-                    Ok(0) => {
-                        eof_reached = true;
-                    },
-                    Ok(n) => {
-                        chunk.truncate(n);
-                        buffer.extend_from_slice(&chunk);
-                        processed_bytes.fetch_add(n, Ordering::Relaxed);
-                    },
-                    Err(e) => {
-                        eprintln!("Read error: {}", e);
-                        break;
-                    }
-                }
-
-                // Find pattern matches in buffer
-                let mut positions = Vec::with_capacity(1024);
-                positions.push(0); // Always include start position
-
-                for i in last_match_pos..buffer.len() {
-                    if i == 0 || buffer[i - 1] == b'\n' {
-                        let input = Input::new(&buffer[i..])
-                            .anchored(Anchored::Yes);
-
-                        if dfa.try_search_fwd(&input).map_or(false, |o| o.is_some()) {
-                            positions.push(i);
-                        }
-                    }
-                }
-
-                // If at EOF, add buffer end as final position
-                if eof_reached {
-                    positions.push(buffer.len());
-                }
-
-                // Sort and deduplicate positions
-                positions.sort_unstable();
-                positions.dedup();
-
-                // If there are multiple positions, send buffer for processing
-                if positions.len() > 1 {
-                    if verbose {
-                        println!("Found {} split points in current segment", positions.len() - 1);
-                    }
-
-                    // Skip processing if last position equals first position
-                    if positions.len() >= 2 && positions[0] != positions[positions.len() - 1] {
-                        let data_to_send = buffer.clone();
-
-                        if let Err(e) = sender.send((data_to_send, positions.clone())) {
-                            eprintln!("Failed to send chunk: {}", e);
-                            break;
-                        }
-
-                        // Update last match position
-                        if let Some(&pos) = positions.last() {
-                            last_match_pos = pos;
-                        }
-                    }
-                }
-
-                // Break if EOF and buffer processed
-                if eof_reached {
+            loop {
+                let mut buffer = vec![0u8; segment_size];
+                let bytes_read = reader.read(&mut buffer)?;
+                if bytes_read == 0 {
                     break;
                 }
-            }
+                buffer.truncate(bytes_read);
 
-            // Process any remaining data if not empty
-            if !buffer.is_empty() && last_match_pos < buffer.len() {
-                let mut positions = vec![last_match_pos, buffer.len()];
-                sender.send((buffer, positions))?;
+                let positions =
+                    find_split_positions_in_segment(&buffer, &*split_dfa, at_line_start, absolute_pos);
+
+                // Calculate next at_line_start before moving buffer
+                let next_at_line_start = buffer.last().map_or(false, |&b| b == b'\n');
+
+                let shared_buffer = SharedBuffer {
+                    data: Arc::new(buffer),
+                    positions,
+                    segment_offset: absolute_pos,
+                };
+
+                sender.send(shared_buffer)?;
+                processed_bytes.fetch_add(bytes_read, Ordering::Relaxed);
+                at_line_start = next_at_line_start;
+                absolute_pos += bytes_read;
             }
 
             Ok(())
         })
     };
 
-    // Wait for reader to finish, then drop sender to signal workers
-    if let Err(e) = reader_thread.join() {
-        eprintln!("Reader thread panicked: {:?}", e);
-    }
-
-    // Signal end of work by dropping the sender
     drop(chunk_sender);
-
-    // Wait for workers to finish
-    for (i, worker) in workers.into_iter().enumerate() {
-        if let Err(e) = worker.join() {
-            eprintln!("Worker {} thread panicked: {:?}", i, e);
-        }
-    }
-
-    if args.verbose {
-        println!("Processed {} chunks", counter.load(Ordering::Relaxed));
+    reader_handle.join().unwrap()?;
+    for _ in 0..worker_count {
+        done_receiver.recv().ok();
     }
 
     Ok(())
+}
+
+// Find split positions within a segment
+fn find_split_positions_in_segment<A: Automaton>(
+    data: &[u8],
+    dfa: &A,
+    at_line_start: bool,
+    segment_offset: usize,
+) -> Vec<usize> {
+    let mut positions = Vec::with_capacity(1024);
+
+    let mut potential_starts = Vec::with_capacity(data.len() / 128);
+    if at_line_start {
+        potential_starts.push(0);
+    }
+    for k in 1..data.len() {
+        if data[k - 1] == b'\n' {
+            potential_starts.push(k);
+        }
+    }
+
+    for &j in &potential_starts {
+        let input = Input::new(&data[j..]).anchored(Anchored::Yes);
+        if matches!(dfa.try_search_fwd(&input), Ok(Some(_))) {
+            positions.push(segment_offset + j);
+        }
+    }
+
+    positions
 }

@@ -1,12 +1,13 @@
 [package]
-name = "cli-rcsplit"
+name = "rst"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
 memmap2 = "0.9"
-rayon = "1.8"
+num_cpus = "1.16"
+rayon = "1.10"
 regex-automata = "0.4"
-crossbeam-channel = "0.5"  # New dependency for streaming processing
