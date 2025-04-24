@@ -1,12 +1,11 @@
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Write, Seek},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -253,6 +252,34 @@ fn process_mapped<A: Automaton + Send + Sync>(
     Ok(())
 }
 
+fn find_all_split_positions<A: Automaton>(
+    file: &File,
+    dfa: &A,
+    segment_size: usize,
+) -> Result<Vec<usize>> {
+    let mut positions = Vec::new();
+    let mut reader = BufReader::with_capacity(segment_size, file);
+    let mut offset = 0;
+    let mut at_line_start = true;
+
+    loop {
+        let mut buffer = vec![0u8; segment_size];
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        buffer.truncate(bytes_read);
+        let segment_positions = find_split_positions_in_segment(&buffer, dfa, at_line_start, offset);
+        positions.extend(segment_positions);
+        at_line_start = buffer.last().map_or(false, |&b| b == b'\n');
+        offset += bytes_read;
+    }
+    positions.push(offset); // End of file as final position
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
+}
+
 fn find_split_positions<A: Automaton + Send + Sync>(
     data: &[u8],
     file_size: usize,
@@ -352,143 +379,48 @@ fn process_streaming<A: Automaton + Send + Sync + 'static>(
     split_dfa: &Arc<A>,
 ) -> Result<()> {
     let segment_size = args.segment_size * 1024 * 1024;
-    let processed_bytes = Arc::new(AtomicUsize::new(0));
-    let channel_size = (args.max_memory * 1024 * 1024 / segment_size).max(2).min(16);
-    let (chunk_sender, chunk_receiver) = bounded::<SharedBuffer>(channel_size);
-    let (done_sender, done_receiver) = bounded::<()>(1);
-    let counter = Arc::new(AtomicUsize::new(0));
+    let positions = find_all_split_positions(&file, &**split_dfa, segment_size)?;
+    let total_chunks = positions.len() - 1;
 
-    let pb = Arc::new(ProgressBar::new(file_size as u64));
-    let style = ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({percent}%)")?
-        .progress_chars("#>-");
-    pb.set_style(style);
+    let pb = ProgressBar::new(total_chunks as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%)")?
+            .progress_chars("#>-"),
+    );
 
-    let worker_count = rayon::current_num_threads().min(8).max(1);
-    let _workers: Vec<_> = (0..worker_count)
-        .map(|worker_id| {
-            let rx = chunk_receiver.clone();
-            let output_dir = output_dir.clone();
-            let counter = counter.clone();
-            let processed_bytes = processed_bytes.clone();
-            let file_size = file_size;
-            let verbose = args.verbose;
-            let trim = args.trim;
-            let buffer_size = args.buffer_size;
-            let done_tx = done_sender.clone();
-            let timeout = Duration::from_secs(args.timeout_secs);
-
-            std::thread::spawn(move || -> Result<()> {
-                loop {
-                    match rx.recv_timeout(timeout) {
-                        Ok(shared_buffer) => {
-                            let positions = &shared_buffer.positions;
-                            let segment_offset = shared_buffer.segment_offset;
-
-                            if positions.len() < 2 {
-                                continue;
-                            }
-
-                            if verbose && worker_id == 0 {
-                                let bytes = processed_bytes.load(Ordering::Relaxed);
-                                let progress = (bytes as f64 / file_size as f64) * 100.0;
-                                println!(
-                                    "Progress: {:.2}% ({}/{} bytes)",
-                                    progress, bytes, file_size
-                                );
-                            }
-
-                            for window in positions.windows(2) {
-                                let chunk = Chunk {
-                                    start: window[0] - segment_offset,
-                                    end: window[1] - segment_offset,
-                                    chunk_num: counter.fetch_add(1, Ordering::Relaxed),
-                                };
-
-                                if chunk.start >= shared_buffer.data.len()
-                                    || chunk.end > shared_buffer.data.len()
-                                    || chunk.start >= chunk.end
-                                {
-                                    if verbose {
-                                        eprintln!(
-                                            "Invalid chunk bounds: start={}, end={}, buffer_len={}",
-                                            chunk.start, chunk.end, shared_buffer.data.len()
-                                        );
-                                    }
-                                    continue;
-                                }
-
-                                process_chunk(
-                                    shared_buffer.data.as_slice(),
-                                    chunk,
-                                    &output_dir,
-                                    trim,
-                                    buffer_size,
-                                    verbose,
-                                )?;
-                            }
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                            if rx.is_empty() {
-                                break;
-                            }
-                            if verbose && worker_id == 0 {
-                                println!("Worker {} timeout, continuing...", worker_id);
-                            }
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                let _ = done_tx.send(());
-                Ok(())
-            })
+    let chunks: Vec<_> = positions
+        .windows(2)
+        .enumerate()
+        .map(|(i, window)| Chunk {
+            start: window[0],
+            end: window[1],
+            chunk_num: i,
         })
         .collect();
 
-    let pb_clone = Arc::clone(&pb);
-    let reader_handle = {
-        let split_dfa = split_dfa.clone();
-        let sender = chunk_sender.clone();
-        let processed_bytes = processed_bytes.clone();
+    chunks.into_par_iter().try_for_each(|chunk| -> Result<()> {
+        let mut file = file.try_clone()?;
+        file.seek(std::io::SeekFrom::Start(chunk.start as u64))?;
+        let mut reader = BufReader::with_capacity(args.buffer_size * 1024, file);
+        let mut data = vec![0u8; chunk.end - chunk.start];
+        reader.read_exact(&mut data)?;
+        process_chunk(
+            &data,
+            Chunk {
+                start: 0,
+                end: data.len(),
+                chunk_num: chunk.chunk_num,
+            },
+            output_dir,
+            args.trim,
+            args.buffer_size,
+            args.verbose,
+        )?;
+        pb.inc(1);
+        Ok(())
+    })?;
 
-        std::thread::spawn(move || -> Result<()> {
-            let mut reader = BufReader::with_capacity(segment_size, file);
-            let mut absolute_pos = 0;
-            let mut at_line_start = true;
-
-            loop {
-                let mut buffer = vec![0u8; segment_size];
-                let bytes_read = reader.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                buffer.truncate(bytes_read);
-
-                let positions =
-                    find_split_positions_in_segment(&buffer, &*split_dfa, at_line_start, absolute_pos);
-                let next_at_line_start = buffer.last().map_or(false, |&b| b == b'\n');
-
-                let shared_buffer = SharedBuffer {
-                    data: Arc::new(buffer),
-                    positions,
-                    segment_offset: absolute_pos,
-                };
-
-                sender.send(shared_buffer)?;
-                pb_clone.inc(bytes_read as u64);
-                processed_bytes.fetch_add(bytes_read, Ordering::Relaxed);
-                at_line_start = next_at_line_start;
-                absolute_pos += bytes_read;
-            }
-            Ok(())
-        })
-    };
-
-    drop(chunk_sender);
-    reader_handle.join().unwrap()?;
-    for _ in 0..worker_count {
-        done_receiver.recv().ok();
-    }
     pb.finish_with_message("Processing complete");
     Ok(())
 }
