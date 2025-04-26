@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fs4::available_space;
 use indicatif::{ProgressBar, ProgressStyle};
+use memchr::memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex_automata::{
@@ -10,7 +11,7 @@ use regex_automata::{
 };
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, BufRead, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+// Command-line arguments for file splitting
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -27,110 +29,305 @@ use std::{
     long_about = "Splits large files into chunks based on a regex pattern, mimicking GNU csplit. Ensures at least one chunk is created with filenames derived from lines starting with '*'. Supports memory-mapped and streaming modes.\n\nUse --streaming for large files or to force streaming mode.\n\nTune performance with buffer_size and max_memory."
 )]
 struct Args {
-    #[arg(short, long)]
+    #[arg(short, long, help = "Input file path")]
     input: String,
-    #[arg(short, long)]
+    #[arg(short, long, help = "Regex pattern for splitting (e.g., '^\\*')")]
     pattern: String,
-    #[arg(short, long, default_value = "out_chunks")]
+    #[arg(short, long, default_value = "out_chunks", help = "Output directory for chunks")]
     output: String,
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(short, long, default_value_t = 4, help = "Number of characters to trim from each line")]
     trim: usize,
-    #[arg(short, long, default_value_t = 256)]
+    #[arg(
+        short,
+        long,
+        default_value_t = 256,
+        help = "Buffer size in KB for I/O operations"
+    )]
     buffer_size: usize,
-    #[arg(short, long, default_value_t = 512)]
+    #[arg(
+        short,
+        long,
+        default_value_t = 512,
+        help = "Maximum memory in MB for memory-mapped mode"
+    )]
     max_memory: usize,
-    #[arg(short, long)]
+    #[arg(short, long, help = "Force streaming mode for large files")]
     streaming: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "Enable verbose output (equivalent to --debug-level 1)")]
     verbose: bool,
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Debug logging level (0=off, 1=basic, 2=samples, 3=raw data, 4=trim summary, 5=full content)"
+    )]
+    debug_level: u8,
+    #[arg(long, default_value_t = 0, help = "Number of threads (0 = auto)")]
     threads: usize,
-    #[arg(long, default_value_t = 300)]
-    timeout_secs: u64,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "Use numbered filenames (xxNN)")]
     numbered: bool,
 }
 
+// Struct to represent a chunk of the input file
 #[derive(Debug, Clone)]
 struct Chunk {
-    start: usize,
-    end: usize,
-    chunk_num: usize,
+    start: usize,    // Start byte position
+    end: usize,      // End byte position
+    chunk_num: usize, // Chunk index
 }
 
-fn generate_filename(data: &[u8], chunk_num: usize, numbered: bool) -> String {
+// Log debug messages based on the required debug level
+// Levels: 1=basic, 2=samples, 3=raw data, 4=trim summary, 5=full content
+fn debug_log(level: u8, required_level: u8, message: &str) {
+    if level >= required_level && required_level > 0 {
+        eprintln!("[DEBUG L{}] {}", required_level, message);
+    }
+}
+
+// Generate filename from chunk data or chunk number
+// Uses first line starting with '*' (stripping '*') or "chunk" if none found
+fn generate_filename(
+    data: &[u8],
+    chunk_num: usize,
+    numbered: bool,
+    debug_level: u8,
+) -> String {
     if numbered {
-        return format!("xx{:02}", chunk_num);
+        let filename = format!("xx{:02}", chunk_num);
+        debug_log(debug_level, 1, &format!("Generated filename: {}", filename));
+        return filename;
     }
 
-    let max_scan = data.len().min(1024);
+    // For small chunks, use entire data; otherwise cap at 1KB or 10 lines
+    let max_scan = if data.len() < 1024 { data.len() } else { 1024 };
     let mut lines = Vec::with_capacity(10);
     let mut start = 0;
     let mut line_count = 0;
 
+    debug_log(
+        debug_level,
+        2,
+        &format!(
+            "Sampling chunk {}: {} bytes, scanning up to {} bytes",
+            chunk_num, data.len(), max_scan
+        ),
+    );
+
+    // Split into lines, handling small or partial chunks
     while start < max_scan && line_count < 10 {
-        let line_end = data[start..]
-            .iter()
-            .position(|&b| b == b'\n')
+        let line_end = memchr(b'\n', &data[start..])
             .map(|p| p + start)
-            .unwrap_or(max_scan);
-        lines.push(&data[start..line_end]);
+            .unwrap_or(data.len().min(max_scan));
+        let line = &data[start..line_end];
+        if !line.is_empty() {
+            lines.push(line);
+        }
         line_count += 1;
         start = line_end + 1;
     }
 
-    let name_line = lines
-        .iter()
-        .find(|line| line.starts_with(b"*"))
-        .copied()
-        .unwrap_or(b"empty");
-
-    let name_str = std::str::from_utf8(name_line).unwrap_or("invalid_utf8");
-    let base_name = if name_str.starts_with('*') {
-        &name_str[1..]
-    } else {
-        name_str
+    // Log sampled lines
+    if debug_level >= 3 {
+        for (i, line) in lines.iter().enumerate() {
+            debug_log(
+                debug_level,
+                3,
+                &format!(
+                    "Sample line {}: {} (bytes: {:?})",
+                    i,
+                    String::from_utf8_lossy(line),
+                    line
+                ),
+            );
+        }
     }
-    .trim();
 
-    let sanitized = base_name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect::<String>();
-    let without_leading = sanitized.trim_start_matches('_');
-    let final_base = if without_leading.is_empty() {
-        "chunk".to_string()
+    // Check if chunk starts with '*' for small chunks
+    let name_line = if data.len() <= 20 && data.starts_with(b"*") {
+        data
     } else {
-        without_leading.chars().take(100).collect()
+        lines
+            .iter()
+            .find(|line| line.starts_with(b"*") && line.len() > 1)
+            .copied()
+            .unwrap_or(b"chunk")
     };
 
-    format!("{}_{:05}.000", final_base, chunk_num)
+    // Convert to string, strip '*' prefix, trim whitespace
+    let name_str = std::str::from_utf8(name_line).unwrap_or("chunk");
+    let base_name = name_str.strip_prefix('*').unwrap_or(name_str).trim();
+
+    debug_log(
+        debug_level,
+        3,
+        &format!(
+            "Selected name: raw={}, base={}",
+            String::from_utf8_lossy(name_line),
+            base_name
+        ),
+    );
+
+    // Sanitize: keep alphanumeric, '_', '-', replace others with '_'
+    let sanitized: String = base_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    let final_base = if trimmed.is_empty() { "chunk" } else { trimmed };
+
+    debug_log(
+        debug_level,
+        3,
+        &format!(
+            "Sanitized name: input={}, sanitized={}, final={}",
+            base_name, sanitized, final_base
+        ),
+    );
+
+    // Format filename
+    let filename = format!("{}_{:05}.000", final_base, chunk_num);
+    debug_log(
+        debug_level,
+        1,
+        &format!("Generated filename: {} for chunk {}", filename, chunk_num),
+    );
+
+    if debug_level >= 2 {
+        let sample = &data[..data.len().min(20)];
+        debug_log(
+            debug_level,
+            2,
+            &format!(
+                "Chunk {} sample: {} (bytes: {:?})",
+                chunk_num,
+                String::from_utf8_lossy(sample),
+                sample
+            ),
+        );
+    }
+
+    filename
 }
 
+// Trim a chunk's lines (skip first two, trim 'trim' characters from rest)
+// Returns a Vec<u8> with trimmed content
+fn trim_chunk(
+    reader: &mut BufReader<File>,
+    chunk_size: usize,
+    trim: usize,
+    debug_level: u8,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(chunk_size.min(1024 * 1024));
+    let mut line_buffer = Vec::with_capacity(1024);
+    let mut line_count = 0;
+    let mut bytes_processed = 0;
+    let mut sample_lines = Vec::new(); // Store first 3 trimmed lines for Level 4
+
+    debug_log(
+        debug_level,
+        1,
+        &format!("Trimming chunk: {} bytes", chunk_size),
+    );
+
+    while bytes_processed < chunk_size {
+        line_buffer.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line_buffer)?;
+        if bytes_read == 0 {
+            if bytes_processed < chunk_size {
+                debug_log(
+                    debug_level,
+                    1,
+                    &format!("Warning: Early EOF at position {}", bytes_processed),
+                );
+            }
+            break;
+        }
+
+        bytes_processed += bytes_read;
+        if bytes_processed > chunk_size {
+            let excess = bytes_processed - chunk_size;
+            line_buffer.truncate(bytes_read - excess);
+        }
+
+        let line = &line_buffer[..line_buffer.len().min(bytes_read)];
+        if line_count >= 2 {
+            let trimmed = if line.len() > trim { &line[trim..] } else { b"" };
+            output.extend_from_slice(trimmed);
+            if bytes_processed < chunk_size || line.ends_with(b"\n") {
+                output.push(b'\n');
+            }
+            if debug_level >= 4 && sample_lines.len() < 3 && !trimmed.is_empty() {
+                sample_lines.push(String::from_utf8_lossy(trimmed).into_owned());
+            }
+        }
+        line_count += 1;
+    }
+
+    debug_log(
+        debug_level,
+        1,
+        &format!(
+            "Trimmed {} bytes from {} lines",
+            output.len(),
+            line_count
+        ),
+    );
+
+    if debug_level >= 4 && !sample_lines.is_empty() {
+        debug_log(
+            debug_level,
+            4,
+            &format!(
+                "Trimming summary: {} lines processed, first few trimmed lines: {:?}",
+                line_count, sample_lines
+            ),
+        );
+    }
+
+    if debug_level >= 5 && !output.is_empty() {
+        let content = &output[..output.len().min(1024)];
+        debug_log(
+            debug_level,
+            5,
+            &format!(
+                "Trimmed output (first 1KB): {}",
+                String::from_utf8_lossy(content)
+            ),
+        );
+    }
+
+    Ok(output)
+}
+
+// Process a single chunk, writing to a file with trimmed lines
 fn process_chunk(
     data: &[u8],
     chunk: Chunk,
     output_dir: &PathBuf,
     trim: usize,
     buffer_size: usize,
-    verbose: bool,
+    debug_level: u8,
     numbered: bool,
 ) -> Result<()> {
     if chunk.start >= chunk.end || chunk.end > data.len() {
-        if verbose {
-            eprintln!("Skipping invalid chunk: {:?}", chunk);
-        }
+        debug_log(
+            debug_level,
+            1,
+            &format!("Skipping invalid chunk: {:?}", chunk),
+        );
         return Ok(());
     }
 
     let chunk_data = &data[chunk.start..chunk.end];
-    let filename = generate_filename(chunk_data, chunk.chunk_num, numbered);
+    let filename = generate_filename(chunk_data, chunk.chunk_num, numbered, debug_level);
     let out_path = output_dir.join(&filename);
+
     if chunk.start == chunk.end {
         fs::write(&out_path, "")?;
-        if verbose {
-            println!("Wrote empty chunk {} to {}", chunk.chunk_num, out_path.display());
-        }
+        debug_log(
+            debug_level,
+            1,
+            &format!("Wrote empty chunk {} to {}", chunk.chunk_num, out_path.display()),
+        );
         return Ok(());
     }
 
@@ -148,6 +345,20 @@ fn process_chunk(
     let mut line_count = 0;
     let mut start = 0;
     const MAX_PROCESS_SIZE: usize = 64 * 1024 * 1024;
+    const WRITE_BATCH_SIZE: usize = 1024 * 1024;
+    let mut write_buffer = Vec::with_capacity(WRITE_BATCH_SIZE);
+    let mut sample_lines = Vec::new(); // Store first 3 trimmed lines for Level 4
+
+    debug_log(
+        debug_level,
+        1,
+        &format!(
+            "Writing chunk {} to {} ({} bytes)",
+            chunk.chunk_num,
+            out_path.display(),
+            chunk_size
+        ),
+    );
 
     while start < chunk_data.len() {
         let process_end = (start + MAX_PROCESS_SIZE).min(chunk_data.len());
@@ -155,48 +366,83 @@ fn process_chunk(
         let mut pos = 0;
 
         while pos < sub_chunk.len() {
-            let line_end = sub_chunk[pos..]
-                .iter()
-                .position(|&b| b == b'\n')
+            let line_end = memchr(b'\n', &sub_chunk[pos..])
                 .map(|p| p + pos)
                 .unwrap_or(sub_chunk.len());
             let line = &sub_chunk[pos..line_end];
             if line_count >= 2 {
-                if line.len() > trim {
-                    writer.write_all(&line[trim..])?;
-                } else {
-                    writer.write_all(line)?;
+                let trimmed = if line.len() > trim { &line[trim..] } else { b"" };
+                write_buffer.extend_from_slice(trimmed);
+                if line_end < sub_chunk.len() || start + line_end < chunk_data.len() {
+                    write_buffer.push(b'\n');
                 }
-                if line_end < sub_chunk.len() {
-                    writer.write_all(b"\n")?;
+                if debug_level >= 4 && sample_lines.len() < 3 && !trimmed.is_empty() {
+                    sample_lines.push(String::from_utf8_lossy(trimmed).into_owned());
                 }
             }
             line_count += 1;
             pos = line_end + 1;
+
+            if write_buffer.len() >= WRITE_BATCH_SIZE {
+                writer.write_all(&write_buffer)?;
+                if debug_level >= 5 {
+                    debug_log(
+                        debug_level,
+                        5,
+                        &format!("Wrote {} bytes to {}", write_buffer.len(), out_path.display()),
+                    );
+                }
+                write_buffer.clear();
+            }
         }
         start = process_end;
+
         if chunk_size > 1024 * 1024 * 1024 {
+            writer.write_all(&write_buffer)?;
+            if debug_level >= 5 {
+                debug_log(
+                    debug_level,
+                    5,
+                    &format!("Wrote {} bytes to {}", write_buffer.len(), out_path.display()),
+                );
+            }
+            write_buffer.clear();
             writer.flush()?;
         }
     }
 
+    if !write_buffer.is_empty() {
+        writer.write_all(&write_buffer)?;
+        if debug_level >= 5 {
+            debug_log(
+                debug_level,
+                5,
+                &format!("Wrote {} bytes to {}", write_buffer.len(), out_path.display()),
+            );
+        }
+    }
     writer.flush()?;
-    if verbose {
-        println!(
-            "Wrote chunk {} to {} ({} bytes)",
-            chunk.chunk_num,
-            out_path.display(),
-            chunk_data.len()
+
+    if debug_level >= 4 && !sample_lines.is_empty() {
+        debug_log(
+            debug_level,
+            4,
+            &format!(
+                "Chunk {} trimming summary: {} lines processed, first few trimmed lines: {:?}",
+                chunk.chunk_num, line_count, sample_lines
+            ),
         );
     }
+
     Ok(())
 }
 
+// Find split positions in data using DFA regex matching
 fn find_split_positions(
     data: &[u8],
     dfa: &dense::DFA<Vec<u32>>,
     segment_offset: usize,
-    verbose: bool,
+    debug_level: u8,
 ) -> Vec<usize> {
     let mut positions = Vec::with_capacity(1024);
     positions.push(segment_offset);
@@ -212,6 +458,17 @@ fn find_split_positions(
             let input = Input::new(&data[i..]).anchored(Anchored::Yes);
             if matches!(dfa.try_search_fwd(&input), Ok(Some(_))) {
                 positions.push(segment_offset + i);
+                let sample = &data[i..(i + 20).min(data.len())];
+                debug_log(
+                    debug_level,
+                    2,
+                    &format!(
+                        "Split at position {}: {} (bytes: {:?})",
+                        segment_offset + i,
+                        String::from_utf8_lossy(sample),
+                        sample
+                    ),
+                );
             }
         }
         i += 1;
@@ -221,17 +478,16 @@ fn find_split_positions(
     positions.sort_unstable();
     positions.dedup();
 
-    if verbose && positions.len() > 2 {
-        println!(
-            "Found {} split points in segment of {} bytes starting at {}",
-            positions.len() - 2,
-            data.len(),
-            segment_offset
-        );
-    }
+    debug_log(
+        debug_level,
+        1,
+        &format!("Found {} split points", positions.len() - 2),
+    );
+
     positions
 }
 
+// Process file using memory-mapped I/O
 fn process_mapped(
     file: File,
     file_size: usize,
@@ -240,9 +496,11 @@ fn process_mapped(
     split_dfa: &Arc<dense::DFA<Vec<u32>>>,
 ) -> Result<()> {
     let mmap = unsafe { Mmap::map(&file)? };
-    let counter = AtomicUsize::new(0);
+    let chunk_counter = AtomicUsize::new(0);
+    let debug_level = if args.verbose { args.debug_level.max(1) } else { args.debug_level };
 
-    let positions = find_split_positions(&mmap, &split_dfa, 0, args.verbose);
+    debug_log(debug_level, 1, "Phase 1: Identifying split positions in the file");
+    let positions = find_split_positions(&mmap, split_dfa, 0, debug_level);
     let total_chunks = positions.len().saturating_sub(1).max(1);
     let pb = ProgressBar::new(total_chunks as u64);
     pb.set_style(
@@ -255,7 +513,7 @@ fn process_mapped(
         vec![Chunk {
             start: 0,
             end: file_size,
-            chunk_num: counter.fetch_add(1, Ordering::Relaxed),
+            chunk_num: chunk_counter.fetch_add(1, Ordering::Relaxed),
         }]
     } else {
         positions
@@ -263,15 +521,19 @@ fn process_mapped(
             .map(|window| Chunk {
                 start: window[0],
                 end: window[1],
-                chunk_num: counter.fetch_add(1, Ordering::Relaxed),
+                chunk_num: chunk_counter.fetch_add(1, Ordering::Relaxed),
             })
             .collect()
     };
+
+    debug_log(debug_level, 1, &format!("Split positions: {:?}", positions));
 
     let has_large_chunk = chunks.iter().any(|chunk| chunk.end - chunk.start > 1024 * 1024 * 1024);
     if has_large_chunk {
         mmap.advise(memmap2::Advice::Sequential)?;
     }
+
+    debug_log(debug_level, 1, &format!("Phase 2: Processing {} chunks", total_chunks));
 
     chunks.par_iter().try_for_each(|chunk| -> Result<()> {
         process_chunk(
@@ -280,30 +542,29 @@ fn process_mapped(
             output_dir,
             args.trim,
             args.buffer_size,
-            args.verbose,
+            debug_level,
             args.numbered,
         )?;
         pb.inc(1);
         Ok(())
     })?;
 
-    pb.finish_with_message("Processing complete");
+    pb.finish();
     Ok(())
 }
 
+// Process file using streaming I/O
 fn process_streaming(
-    file: File,
+    _file: File,
     file_size: usize,
     output_dir: &PathBuf,
     args: &Args,
     split_dfa: &Arc<dense::DFA<Vec<u32>>>,
 ) -> Result<()> {
-    let verbose = args.verbose;
+    let debug_level = if args.verbose { args.debug_level.max(1) } else { args.debug_level };
     let input_path = PathBuf::from(&args.input);
 
-    if verbose {
-        println!("Phase 1: Identifying split positions in the file");
-    }
+    debug_log(debug_level, 1, "Phase 1: Identifying split positions in the file");
 
     let pb = ProgressBar::new(file_size as u64);
     pb.set_style(
@@ -312,45 +573,48 @@ fn process_streaming(
             .progress_chars("#>-"),
     );
 
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, File::open(&input_path)?);
+    let mut reader = BufReader::with_capacity(16 * 1024 * 1024, File::open(&input_path)?);
     let mut positions = Vec::with_capacity(1024);
     positions.push(0);
     let mut buffer = Vec::with_capacity(16 * 1024);
-    let mut pos = 0;
+    let mut file_pos = 0;
     let mut line_start = 0;
 
-    while pos < file_size {
+    while file_pos < file_size {
         buffer.clear();
         let bytes_read = reader.read_until(b'\n', &mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        if pos == line_start {
+        if file_pos == line_start {
             let input = Input::new(&buffer).anchored(Anchored::Yes);
             if matches!(split_dfa.try_search_fwd(&input), Ok(Some(_))) {
-                positions.push(pos);
-                if verbose && positions.len() % 100 == 0 {
-                    println!("Found {} split points so far", positions.len());
-                }
+                positions.push(file_pos);
+                debug_log(
+                    debug_level,
+                    2,
+                    &format!(
+                        "Split at position {}: {} (bytes: {:?})",
+                        file_pos,
+                        String::from_utf8_lossy(&buffer[..buffer.len().min(20)]),
+                        &buffer[..buffer.len().min(20)]
+                    ),
+                );
             }
         }
-        pos += bytes_read;
-        line_start = pos;
-        pb.set_position(pos as u64);
+        file_pos += bytes_read;
+        line_start = file_pos;
+        pb.set_position(file_pos as u64);
     }
     positions.push(file_size);
     positions.sort_unstable();
     positions.dedup();
 
-    pb.finish_with_message(format!("Found {} split points", positions.len() - 2));
+    pb.finish();
 
-    if verbose {
-        println!("Split positions: {:?}", positions);
-    }
+    debug_log(debug_level, 1, &format!("Split positions: {:?}", positions));
 
-    if verbose {
-        println!("Phase 2: Processing {} chunks", positions.len() - 1);
-    }
+    debug_log(debug_level, 1, &format!("Phase 2: Processing {} chunks", positions.len() - 1));
 
     let chunks: Vec<_> = if positions.len() <= 2 && positions[0] == 0 && positions[1] == file_size {
         vec![(0, file_size)]
@@ -366,99 +630,133 @@ fn process_streaming(
             .progress_chars("#>-"),
     );
 
-    let counter = AtomicUsize::new(0);
+    let chunk_counter = AtomicUsize::new(0);
     for (start_pos, end_pos) in chunks {
         let chunk_size = end_pos - start_pos;
-        if chunk_size == 0 {
-            if verbose {
-                println!("Writing empty chunk {} at {}", counter.fetch_add(1, Ordering::Relaxed), start_pos);
-            }
-            let chunk_num = counter.fetch_add(1, Ordering::Relaxed);
-            let filename = generate_filename(&[], chunk_num, args.numbered);
-            let out_path = output_dir.join(&filename);
-            fs::write(&out_path, "")?;
-            continue;
-        }
+        let chunk_num = chunk_counter.fetch_add(1, Ordering::Relaxed);
 
-        let chunk_num = counter.fetch_add(1, Ordering::Relaxed);
-        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, File::open(&input_path)?);
+        let mut reader = BufReader::with_capacity(16 * 1024 * 1024, File::open(&input_path)?);
         reader.seek(SeekFrom::Start(start_pos as u64))?;
 
-        // Read up to 10 lines or 1KB for naming
+        debug_log(
+            debug_level,
+            3,
+            &format!("Seeking to position {} for chunk {}", start_pos, chunk_num),
+        );
+
+        // Sample entire chunk for small chunks, else cap at 1KB
         let mut sample = Vec::with_capacity(1024);
-        let mut lines_read = 0;
+        let max_sample = if chunk_size < 1024 { chunk_size } else { 1024 };
         let mut total_bytes = 0;
-        buffer.clear();
-        while lines_read < 10 && total_bytes < 1024 && total_bytes < chunk_size {
+        let mut lines_read = 0;
+
+        debug_log(
+            debug_level,
+            2,
+            &format!(
+                "Sampling chunk {}: start={}, size={}, max_sample={}",
+                chunk_num, start_pos, chunk_size, max_sample
+            ),
+        );
+
+        while total_bytes < max_sample && lines_read < 10 {
+            buffer.clear();
             let bytes_read = reader.read_until(b'\n', &mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            sample.extend_from_slice(&buffer[..bytes_read]);
-            total_bytes += bytes_read;
+            let to_copy = (max_sample - total_bytes).min(bytes_read);
+            sample.extend_from_slice(&buffer[..to_copy]);
+            total_bytes += to_copy;
             lines_read += 1;
-            buffer.clear();
+
+            if debug_level >= 3 {
+                debug_log(
+                    debug_level,
+                    3,
+                    &format!(
+                        "Sample read: {} (bytes: {:?})",
+                        String::from_utf8_lossy(&buffer[..to_copy]),
+                        &buffer[..to_copy]
+                    ),
+                );
+            }
         }
 
-        let filename = generate_filename(&sample, chunk_num, args.numbered);
+        let filename = generate_filename(&sample, chunk_num, args.numbered, debug_level);
         let out_path = output_dir.join(&filename);
-
-        if verbose {
-            println!(
-                "Writing chunk {} to {} ({} bytes)",
-                chunk_num, out_path.display(), chunk_size
-            );
-        }
 
         reader.seek(SeekFrom::Start(start_pos as u64))?;
         let file = File::create(&out_path)?;
-        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let mut writer = BufWriter::with_capacity(32 * 1024 * 1024, file);
 
-        let mut bytes_processed = 0;
-        let buffer_size = 8 * 1024 * 1024;
-        let mut buffer = vec![0u8; buffer_size];
+        if chunk_size == 0 {
+            fs::write(&out_path, "")?;
+            debug_log(
+                debug_level,
+                1,
+                &format!("Wrote empty chunk {} to {}", chunk_num, out_path.display()),
+            );
+            writer.flush()?;
+            pb.inc(1);
+            continue;
+        }
 
-        while bytes_processed < chunk_size {
-            let bytes_to_read = buffer_size.min(chunk_size - bytes_processed);
-            let bytes_read = reader.read(&mut buffer[0..bytes_to_read])?;
-            if bytes_read == 0 {
-                eprintln!(
-                    "Warning: Early EOF at chunk {} position {}",
-                    chunk_num,
-                    start_pos + bytes_processed
-                );
-                break;
-            }
-            writer.write_all(&buffer[0..bytes_read])?;
-            bytes_processed += bytes_read;
+        let trimmed_data = trim_chunk(&mut reader, chunk_size, args.trim, debug_level)?;
+        writer.write_all(&trimmed_data)?;
+        if debug_level >= 5 {
+            debug_log(
+                debug_level,
+                5,
+                &format!(
+                    "Wrote {} trimmed bytes to {}",
+                    trimmed_data.len(),
+                    out_path.display()
+                ),
+            );
         }
         writer.flush()?;
+
         pb.inc(1);
     }
 
-    pb.finish_with_message("All chunks processed");
+    pb.finish();
     Ok(())
 }
 
+// Main function to orchestrate file splitting
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
-
-    if args.threads > 1024 {
-        eprintln!("Warning: High thread count ({}). May impact performance.", args.threads);
-    }
-    if args.buffer_size > 10240 {
-        eprintln!(
-            "Warning: Large buffer size ({}KB). May increase memory usage.",
-            args.buffer_size
-        );
-    }
+    let debug_level = if args.verbose { args.debug_level.max(1) } else { args.debug_level };
 
     let thread_count = if args.threads > 0 {
         args.threads.min(num_cpus::get().max(1))
     } else {
         num_cpus::get().max(1)
     };
+
+    if thread_count > 1024 {
+        debug_log(
+            debug_level,
+            1,
+            &format!(
+                "Warning: High thread count ({}). May impact performance.",
+                thread_count
+            ),
+        );
+    }
+    if args.buffer_size > 10240 {
+        debug_log(
+            debug_level,
+            1,
+            &format!(
+                "Warning: Large buffer size ({}KB). May increase memory usage.",
+                args.buffer_size
+            ),
+        );
+    }
+
     rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build_global()
@@ -488,12 +786,20 @@ fn main() -> Result<()> {
     }
 
     if file_size as u64 > 4 * 1024 * 1024 * 1024 {
-        eprintln!("Warning: Large files (>4GB) may not be supported on FAT32/exFAT.");
+        debug_log(
+            debug_level,
+            1,
+            "Warning: Large files (>4GB) may not be supported on FAT32/exFAT.",
+        );
     }
     if file_size as u64 > i64::MAX as u64 {
-        eprintln!(
-            "Warning: File size ({} bytes) exceeds 2^63-1. Some operations may fail.",
-            file_size
+        debug_log(
+            debug_level,
+            1,
+            &format!(
+                "Warning: File size ({} bytes) exceeds 2^63-1. Some operations may fail.",
+                file_size
+            ),
         );
     }
 
@@ -518,26 +824,28 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {}", e))?,
     );
 
-    if args.verbose {
-        println!("Processing file: {} ({} bytes)", args.input, file_size);
-    }
+    debug_log(
+        debug_level,
+        1,
+        &format!("Processing file: {} ({} bytes)", args.input, file_size),
+    );
 
     let max_memory_bytes = args.max_memory * 1024 * 1024;
     let force_streaming = file_size > 4 * 1024 * 1024 * 1024;
 
     if args.streaming || file_size > max_memory_bytes || force_streaming {
-        if args.verbose {
+        debug_log(
+            debug_level,
+            1,
             if force_streaming {
-                println!("Using streaming mode (forced for file > 4GB)");
+                "Using streaming mode (forced for file > 4GB)"
             } else {
-                println!("Using streaming mode");
-            }
-        }
+                "Using streaming mode"
+            },
+        );
         process_streaming(file, file_size, &output_dir, &args, &split_dfa)?;
     } else {
-        if args.verbose {
-            println!("Using memory-mapped mode");
-        }
+        debug_log(debug_level, 1, "Using memory-mapped mode");
         process_mapped(file, file_size, &output_dir, &args, &split_dfa)?;
     }
 
