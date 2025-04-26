@@ -58,7 +58,7 @@ struct Args {
     #[arg(
         long,
         default_value_t = 0,
-        help = "Debug logging level (0=off, 1=basic, 2=actions, 3=names, 4=trim summary, 5=one-line summary)"
+        help = "Debug logging level (0=off, 1=basic, 2=actions, 3=names+lines, 4=trim+lines, 5=stats)"
     )]
     debug_level: u8,
     #[arg(long, default_value_t = 0, help = "Number of threads (0 = auto)")]
@@ -76,7 +76,7 @@ struct Chunk {
 }
 
 // Log debug messages based on the required debug level
-// Levels: 1=basic, 2=actions, 3=names, 4=trim summary, 5=one-line summary
+// Levels: 1=basic, 2=actions, 3=names+lines, 4=trim+lines, 5=stats
 fn debug_log(level: u8, required_level: u8, message: &str) {
     if level >= required_level && required_level > 0 {
         eprintln!("[DEBUG L{}] {}", required_level, message);
@@ -84,7 +84,6 @@ fn debug_log(level: u8, required_level: u8, message: &str) {
 }
 
 // Generate filename from chunk data or chunk number
-// Uses first line starting with '*' (stripping '*') or "chunk" if none found
 fn generate_filename(
     data: &[u8],
     chunk_num: usize,
@@ -144,11 +143,9 @@ fn generate_filename(
             &format!("Chunk {}: Raw name {}, base {}", chunk_num, name_str, base_name),
         );
         for (i, line) in lines.iter().enumerate() {
-            debug_log(
-                debug_level,
-                3,
-                &format!("Sample line {}: {}", i, String::from_utf8_lossy(line)),
-            );
+            let s = String::from_utf8_lossy(line).into_owned();
+            let s = if s.len() > 50 { format!("{}...", &s[..47]) } else { s };
+            debug_log(debug_level, 3, &format!("Sample line {}: {}", i, s));
         }
     }
 
@@ -180,18 +177,20 @@ fn generate_filename(
     filename
 }
 
-// Trim a chunk's lines (skip first two, trim 'trim' characters from rest)
+// Trim a chunk's lines (skip first two, trim 'trim' chars)
 fn trim_chunk(
     reader: &mut BufReader<File>,
     chunk_size: usize,
     trim: usize,
     debug_level: u8,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
     let mut output = Vec::with_capacity(chunk_size.min(1024 * 1024));
     let mut line_buffer = Vec::with_capacity(1024);
     let mut line_count = 0;
     let mut bytes_processed = 0;
-    let mut sample_lines = Vec::new(); // Store up to 3 trimmed lines
+    let mut sample_lines = Vec::new(); // Up to 3 trimmed lines
+    let mut first_line = None;
+    let mut second_line = None;
 
     debug_log(
         debug_level,
@@ -220,6 +219,14 @@ fn trim_chunk(
         }
 
         let line = &line_buffer[..line_buffer.len().min(bytes_read)];
+        if line_count == 0 && !line.is_empty() {
+            let s = String::from_utf8_lossy(line).into_owned();
+            first_line = Some(if s.len() > 50 { format!("{}...", &s[..47]) } else { s });
+        } else if line_count == 1 && !line.is_empty() {
+            let s = String::from_utf8_lossy(line).into_owned();
+            second_line = Some(if s.len() > 50 { format!("{}...", &s[..47]) } else { s });
+        }
+
         if line_count >= 2 {
             let trimmed = if line.len() > trim { &line[trim..] } else { b"" };
             output.extend_from_slice(trimmed);
@@ -244,32 +251,39 @@ fn trim_chunk(
         &format!("Trimmed {} bytes from {} lines", output.len(), line_count),
     );
 
+    if debug_level >= 3 && line_count > 0 {
+        debug_log(
+            debug_level,
+            3,
+            &format!(
+                "Chunk: First line: {}, Second line: {}, Size before trim: {} bytes",
+                first_line.as_ref().unwrap_or(&"None".to_string()),
+                second_line.as_ref().unwrap_or(&"None".to_string()),
+                chunk_size
+            ),
+        );
+    }
+
     if debug_level >= 4 && line_count > 0 {
         debug_log(
             debug_level,
             4,
             &format!(
-                "Chunk trimming: Processed {} lines, trimmed {} bytes, sample: {:?}",
-                line_count, output.len(), sample_lines
+                "Chunk trimming: Processed {} lines, trimmed {} bytes, First line: {}, Second line: {}, Size after trim: {} bytes, sample: {:?}",
+                line_count,
+                output.len(),
+                first_line.as_ref().unwrap_or(&"None".to_string()),
+                second_line.as_ref().unwrap_or(&"None".to_string()),
+                output.len(),
+                sample_lines
             ),
         );
     }
 
-    if debug_level >= 5 {
-        debug_log(
-            debug_level,
-            5,
-            &format!(
-                "Chunk trimmed: {} bytes, {} lines processed",
-                output.len(), line_count
-            ),
-        );
-    }
-
-    Ok(output)
+    Ok((output, first_line, second_line))
 }
 
-// Process a single chunk, writing to a file with trimmed lines
+// Process a single chunk, writing to a file
 fn process_chunk(
     data: &[u8],
     chunk: Chunk,
@@ -278,14 +292,14 @@ fn process_chunk(
     buffer_size: usize,
     debug_level: u8,
     numbered: bool,
-) -> Result<()> {
+) -> Result<usize> {
     if chunk.start >= chunk.end || chunk.end > data.len() {
         debug_log(
             debug_level,
             1,
             &format!("Skipped invalid chunk {}", chunk.chunk_num),
         );
-        return Ok(());
+        return Ok(0);
     }
 
     let chunk_data = &data[chunk.start..chunk.end];
@@ -299,7 +313,7 @@ fn process_chunk(
             1,
             &format!("Wrote empty chunk {}: {}", chunk.chunk_num, filename),
         );
-        return Ok(());
+        return Ok(0);
     }
 
     let file = File::create(&out_path)
@@ -319,6 +333,8 @@ fn process_chunk(
     const WRITE_BATCH_SIZE: usize = 1024 * 1024;
     let mut write_buffer = Vec::with_capacity(WRITE_BATCH_SIZE);
     let mut sample_lines = Vec::new();
+    let mut first_line = None;
+    let mut second_line = None;
 
     debug_log(
         debug_level,
@@ -336,6 +352,13 @@ fn process_chunk(
                 .map(|p| p + pos)
                 .unwrap_or(sub_chunk.len());
             let line = &sub_chunk[pos..line_end];
+            if line_count == 0 && !line.is_empty() {
+                let s = String::from_utf8_lossy(line).into_owned();
+                first_line = Some(if s.len() > 50 { format!("{}...", &s[..47]) } else { s });
+            } else if line_count == 1 && !line.is_empty() {
+                let s = String::from_utf8_lossy(line).into_owned();
+                second_line = Some(if s.len() > 50 { format!("{}...", &s[..47]) } else { s });
+            }
             if line_count >= 2 {
                 let trimmed = if line.len() > trim { &line[trim..] } else { b"" };
                 write_buffer.extend_from_slice(trimmed);
@@ -373,32 +396,41 @@ fn process_chunk(
     }
     writer.flush()?;
 
+    if debug_level >= 3 && line_count > 0 {
+        debug_log(
+            debug_level,
+            3,
+            &format!(
+                "Chunk {}: First line: {}, Second line: {}, Size before trim: {} bytes",
+                chunk.chunk_num,
+                first_line.as_ref().unwrap_or(&"None".to_string()),
+                second_line.as_ref().unwrap_or(&"None".to_string()),
+                chunk_size
+            ),
+        );
+    }
+
     if debug_level >= 4 && line_count > 0 {
         debug_log(
             debug_level,
             4,
             &format!(
-                "Chunk {} trimming: Processed {} lines, trimmed {} bytes, sample: {:?}",
-                chunk.chunk_num, line_count, chunk_data.len(), sample_lines
+                "Chunk {} trimming: Processed {} lines, trimmed {} bytes, First line: {}, Second line: {}, Size after trim: {} bytes, sample: {:?}",
+                chunk.chunk_num,
+                line_count,
+                chunk_data.len(),
+                first_line.as_ref().unwrap_or(&"None".to_string()),
+                second_line.as_ref().unwrap_or(&"None".to_string()),
+                chunk_data.len(),
+                sample_lines
             ),
         );
     }
 
-    if debug_level >= 5 {
-        debug_log(
-            debug_level,
-            5,
-            &format!(
-                "Chunk {}: {}, {} bytes, trimmed {} bytes, {} lines",
-                chunk.chunk_num, filename, chunk_size, chunk_data.len(), line_count
-            ),
-        );
-    }
-
-    Ok(())
+    Ok(chunk_size)
 }
 
-// Find split positions in data using DFA regex matching
+// Find split positions in data using DFA regex
 fn find_split_positions(
     data: &[u8],
     dfa: &dense::DFA<Vec<u32>>,
@@ -449,7 +481,7 @@ fn process_mapped(
     output_dir: &PathBuf,
     args: &Args,
     split_dfa: &Arc<dense::DFA<Vec<u32>>>,
-) -> Result<()> {
+) -> Result<usize> {
     let mmap = unsafe { Mmap::map(&file)? };
     let chunk_counter = AtomicUsize::new(0);
     let debug_level = if args.verbose { args.debug_level.max(1) } else { args.debug_level };
@@ -490,22 +522,24 @@ fn process_mapped(
 
     debug_log(debug_level, 1, &format!("Phase 2: Processing {} chunks", total_chunks));
 
-    chunks.par_iter().try_for_each(|chunk| -> Result<()> {
-        process_chunk(
-            &mmap,
-            chunk.clone(),
-            output_dir,
-            args.trim,
-            args.buffer_size,
-            debug_level,
-            args.numbered,
-        )?;
-        pb.inc(1);
-        Ok(())
-    })?;
+    let total_bytes: usize = chunks
+        .par_iter()
+        .map(|chunk| {
+            process_chunk(
+                &mmap,
+                chunk.clone(),
+                output_dir,
+                args.trim,
+                args.buffer_size,
+                debug_level,
+                args.numbered,
+            )
+            .unwrap_or(0)
+        })
+        .sum();
 
     pb.finish();
-    Ok(())
+    Ok(total_bytes)
 }
 
 // Process file using streaming I/O
@@ -515,7 +549,7 @@ fn process_streaming(
     output_dir: &PathBuf,
     args: &Args,
     split_dfa: &Arc<dense::DFA<Vec<u32>>>,
-) -> Result<()> {
+) -> Result<usize> {
     let debug_level = if args.verbose { args.debug_level.max(1) } else { args.debug_level };
     let input_path = PathBuf::from(&args.input);
 
@@ -543,7 +577,6 @@ fn process_streaming(
         }
         if file_pos == line_start {
             let input = Input::new(&buffer).anchored(Anchored::Yes);
-            // dont do this dfa is wrong is should split_dfa
             if matches!(split_dfa.try_search_fwd(&input), Ok(Some(_))) {
                 positions.push(file_pos);
                 debug_log(
@@ -582,6 +615,8 @@ fn process_streaming(
     );
 
     let chunk_counter = AtomicUsize::new(0);
+    let mut total_bytes = 0;
+
     for (start_pos, end_pos) in chunks {
         let chunk_size = end_pos - start_pos;
         let chunk_num = chunk_counter.fetch_add(1, Ordering::Relaxed);
@@ -595,10 +630,10 @@ fn process_streaming(
             &format!("Seeking to position {} for chunk {}", start_pos, chunk_num),
         );
 
-        // Sample entire chunk for small chunks, else cap at 1KB
+        // Sample chunk
         let mut sample = Vec::with_capacity(1024);
         let max_sample = if chunk_size < 1024 { chunk_size } else { 1024 };
-        let mut total_bytes = 0;
+        let mut total_bytes_sample = 0;
         let mut lines_read = 0;
 
         debug_log(
@@ -610,23 +645,21 @@ fn process_streaming(
             ),
         );
 
-        while total_bytes < max_sample && lines_read < 10 {
+        while total_bytes_sample < max_sample && lines_read < 10 {
             buffer.clear();
             let bytes_read = reader.read_until(b'\n', &mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            let to_copy = (max_sample - total_bytes).min(bytes_read);
+            let to_copy = (max_sample - total_bytes_sample).min(bytes_read);
             sample.extend_from_slice(&buffer[..to_copy]);
-            total_bytes += to_copy;
+            total_bytes_sample += to_copy;
             lines_read += 1;
 
             if debug_level >= 3 {
-                debug_log(
-                    debug_level,
-                    3,
-                    &format!("Sample: {}", String::from_utf8_lossy(&buffer[..to_copy])),
-                );
+                let s = String::from_utf8_lossy(&buffer[..to_copy]).into_owned();
+                let s = if s.len() > 50 { format!("{}...", &s[..47]) } else { s };
+                debug_log(debug_level, 3, &format!("Sample: {}", s));
             }
         }
 
@@ -649,15 +682,16 @@ fn process_streaming(
             continue;
         }
 
-        let trimmed_data = trim_chunk(&mut reader, chunk_size, args.trim, debug_level)?;
+        let (trimmed_data, _first_line, _second_line) = trim_chunk(&mut reader, chunk_size, args.trim, debug_level)?;
         writer.write_all(&trimmed_data)?;
         writer.flush()?;
 
+        total_bytes += chunk_size;
         pb.inc(1);
     }
 
     pb.finish();
-    Ok(())
+    Ok(total_bytes)
 }
 
 // Main function to orchestrate file splitting
@@ -765,6 +799,7 @@ fn main() -> Result<()> {
 
     let max_memory_bytes = args.max_memory * 1024 * 1024;
     let force_streaming = file_size > 4 * 1024 * 1024 * 1024;
+    let total_bytes;
 
     if args.streaming || file_size > max_memory_bytes || force_streaming {
         debug_log(
@@ -776,13 +811,31 @@ fn main() -> Result<()> {
                 "Using streaming mode"
             },
         );
-        process_streaming(file, file_size, &output_dir, &args, &split_dfa)?;
+        total_bytes = process_streaming(file, file_size, &output_dir, &args, &split_dfa)?;
     } else {
         debug_log(debug_level, 1, "Using memory-mapped mode");
-        process_mapped(file, file_size, &output_dir, &args, &split_dfa)?;
+        total_bytes = process_mapped(file, file_size, &output_dir, &args, &split_dfa)?;
     }
 
     let duration = start_time.elapsed();
+    let total_chunks = (total_bytes as f64 / file_size as f64).ceil() as usize;
+    let peak_memory_mb = if args.streaming || file_size > max_memory_bytes || force_streaming {
+        49.0 // BufReader (16MB) + BufWriter (32MB) + sample (1MB)
+    } else {
+        (file_size as f64 / 1024.0 / 1024.0).min(max_memory_bytes as f64 / 1024.0 / 1024.0) + 64.0
+    };
+
+    if debug_level >= 5 {
+        debug_log(
+            debug_level,
+            5,
+            &format!(
+                "Summary: Processed {} ({} bytes), {} chunks, {} bytes written, time: {:.2?}, peak memory: ~{}MB",
+                args.input, file_size, total_chunks, total_bytes, duration, peak_memory_mb as usize
+            ),
+        );
+    }
+
     println!("Total processing time: {:.2?}", duration);
     Ok(())
 }
