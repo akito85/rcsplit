@@ -483,7 +483,7 @@ fn process_streaming(
         }
         if file_pos == line_start {
             let input = Input::new(&buffer).anchored(Anchored::Yes);
-            if matches!(dfa.try_search_fwd(&input), Ok(Some(_))) {
+            if matches!(split_dfa.try_search_fwd(&input), Ok(Some(_))) {
                 positions.push(file_pos);
                 debug_log(
                     debug_level,
